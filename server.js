@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const Stripe = require('stripe');
 
 // ---- ゲーム定数 ----
 
@@ -229,8 +230,97 @@ const VOTE_CATEGORIES = ['読みやすさ', '具体性', '伝わりやすさ', '
 const BASE_MAX = 60;
 const BONUS_MAX = 40;
 
+// ---- 決済（Stripe / 部屋作成チケット制）----
+// STRIPE_SECRET_KEY が未設定のときは開発用に決済チェックをスキップする
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const TICKET_PRICE_JPY = Number(process.env.TICKET_PRICE_JPY || 500);
+const PAYMENTS_ENABLED = !!STRIPE_SECRET_KEY;
+const stripe = PAYMENTS_ENABLED ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+if (!PAYMENTS_ENABLED) {
+  console.warn('[決済] STRIPE_SECRET_KEY が未設定のため、決済チェックをスキップするモードで起動します（開発用）。');
+}
+
+// 使用済みの Checkout Session ID（= チケット）を記録し、二重利用を防ぐ。
+// メモリ上のみの管理のため、サーバー再起動でリセットされる点に注意。
+const consumedTickets = new Set();
+
 const app = express();
 app.use(express.static(__dirname));
+
+// Stripe Webhook は署名検証のため raw body が必要 → express.json() より前に定義する
+app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!PAYMENTS_ENABLED) return res.status(200).send('payments disabled');
+  let event;
+  try {
+    if (STRIPE_WEBHOOK_SECRET) {
+      const sig = req.headers['stripe-signature'];
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } else {
+      event = JSON.parse(req.body.toString('utf8'));
+    }
+  } catch (err) {
+    console.error('[Webhook] 署名検証エラー:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  if (event.type === 'checkout.session.completed') {
+    console.log('[Webhook] 決済完了:', event.data.object.id);
+  }
+  res.json({ received: true });
+});
+
+app.use(express.json());
+
+// チェックアウトセッションを作成し、Stripe Checkout の URL を返す
+app.post('/api/create-checkout-session', async (req, res) => {
+  if (!PAYMENTS_ENABLED) {
+    // 開発用：決済なしでダミーの ticketId を発行
+    return res.json({ devMode: true, ticketId: `dev_${Date.now()}` });
+  }
+  try {
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'jpy',
+            product_data: {
+              name: '9マス式ライティングゲーム 部屋作成チケット（1回分）',
+            },
+            unit_amount: TICKET_PRICE_JPY,
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: `${origin}/?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/`,
+    });
+    res.json({ url: session.url, ticketId: session.id });
+  } catch (err) {
+    console.error('[Checkout] 作成エラー:', err.message);
+    res.status(500).json({ error: 'チェックアウトの作成に失敗しました。' });
+  }
+});
+
+// 支払い済み・未使用のチケットかどうかを確認する（部屋作成前のフロント側チェック用）
+app.get('/api/verify-session', async (req, res) => {
+  const sessionId = String(req.query.session_id || '');
+  if (!sessionId) return res.json({ valid: false, reason: 'no_session' });
+  if (consumedTickets.has(sessionId)) return res.json({ valid: false, reason: 'already_used' });
+  if (!PAYMENTS_ENABLED) {
+    // 開発用：dev_ プレフィックスのダミーチケットはそのまま有効扱い
+    return res.json({ valid: sessionId.startsWith('dev_') });
+  }
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    res.json({ valid: session.payment_status === 'paid' });
+  } catch (err) {
+    res.json({ valid: false, reason: 'not_found' });
+  }
+});
 
 const server = http.createServer(app);
 const io = new Server(server);
@@ -451,8 +541,34 @@ function startPresenting(room) {
   checkVotingComplete(room);
 }
 
+// チケット（Checkout Session ID）が支払い済み・未使用かをサーバー側で確認する。
+// これが「部屋作成＝有料」を担保する唯一の関所（フロント側のチェックは信用しない）。
+async function verifyAndConsumeTicket(ticketId) {
+  if (!ticketId || typeof ticketId !== 'string') return { ok: false, reason: 'missing' };
+  if (consumedTickets.has(ticketId)) return { ok: false, reason: 'already_used' };
+  if (!PAYMENTS_ENABLED) {
+    // 開発用モード：dev_ プレフィックスのダミーチケットのみ許可
+    if (!ticketId.startsWith('dev_')) return { ok: false, reason: 'invalid' };
+    consumedTickets.add(ticketId);
+    return { ok: true };
+  }
+  try {
+    const session = await stripe.checkout.sessions.retrieve(ticketId);
+    if (session.payment_status !== 'paid') return { ok: false, reason: 'not_paid' };
+    consumedTickets.add(ticketId); // 即座に使用済みにして二重利用を防ぐ
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: 'not_found' };
+  }
+}
+
 io.on('connection', (socket) => {
-  socket.on('createRoom', ({ name }) => {
+  socket.on('createRoom', async ({ name, ticketId } = {}) => {
+    const result = await verifyAndConsumeTicket(ticketId);
+    if (!result.ok) {
+      socket.emit('errorMsg', '部屋の作成には決済の確認が必要です。もう一度お試しください（決済がまだの場合は購入してください）。');
+      return;
+    }
     const cleanName = (name || '').trim().slice(0, 20) || 'ファシリテーター';
     const room = createRoom(socket.id, cleanName);
     socket.join(room.code);
