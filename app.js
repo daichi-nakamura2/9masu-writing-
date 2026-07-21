@@ -27,13 +27,62 @@ function playerById(id) {
   return state ? state.players.find((p) => p.id === id) || null : null;
 }
 
-// ---- 開始画面 ----
-el('btn-create').addEventListener('click', () => {
-  socket.emit('createRoom', { name: el('create-name').value });
+// ---- 開始画面（部屋作成は決済制）----
+const TICKET_NAME_KEY = '9masu_pending_facilitator_name';
+
+el('btn-create').addEventListener('click', async () => {
+  const name = el('create-name').value;
+  const btn = el('btn-create');
+  btn.disabled = true;
+  btn.textContent = '決済ページへ移動中…';
+  try {
+    localStorage.setItem(TICKET_NAME_KEY, name || '');
+    const res = await fetch('/api/create-checkout-session', { method: 'POST' });
+    const data = await res.json();
+    if (data.devMode) {
+      // STRIPE_SECRET_KEY 未設定の開発環境：決済をスキップして即作成
+      socket.emit('createRoom', { name, ticketId: data.ticketId });
+      btn.disabled = false;
+      btn.textContent = '部屋を作成する';
+      return;
+    }
+    if (data.url) {
+      window.location.href = data.url; // Stripe Checkout へ遷移
+      return;
+    }
+    throw new Error(data.error || '不明なエラー');
+  } catch (err) {
+    showError('start-error', '決済ページを開けませんでした。時間をおいて再度お試しください。');
+    btn.disabled = false;
+    btn.textContent = '部屋を作成する';
+  }
 });
+
 el('btn-join').addEventListener('click', () => {
   socket.emit('joinRoom', { code: el('join-code').value, name: el('join-name').value });
 });
+
+// Stripe Checkout から戻ってきたとき（?session_id=xxx）に、支払い確認→自動で部屋作成
+(async function handleCheckoutReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = params.get('session_id');
+  if (!sessionId) return;
+  // URL からクエリを消しておく（リロードで二重処理されないように）
+  window.history.replaceState({}, document.title, window.location.pathname);
+  try {
+    const res = await fetch(`/api/verify-session?session_id=${encodeURIComponent(sessionId)}`);
+    const data = await res.json();
+    if (!data.valid) {
+      showError('start-error', '決済が確認できませんでした。お手数ですが最初からお試しください。');
+      return;
+    }
+    const name = localStorage.getItem(TICKET_NAME_KEY) || '';
+    localStorage.removeItem(TICKET_NAME_KEY);
+    socket.emit('createRoom', { name, ticketId: sessionId });
+  } catch (err) {
+    showError('start-error', '決済の確認中にエラーが発生しました。');
+  }
+})();
 
 socket.on('joined', (data) => {
   selfId = data.selfId;
